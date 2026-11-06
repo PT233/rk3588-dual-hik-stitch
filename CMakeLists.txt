@@ -1,0 +1,42 @@
+cmake_minimum_required(VERSION 3.18)
+project(dual_hik_stitch LANGUAGES CXX)
+
+set(LYSTREAM_SOURCE_DIR "" CACHE PATH "Path to the PT233/lystream checkout")
+if(NOT LYSTREAM_SOURCE_DIR)
+    include(FetchContent)
+    FetchContent_Declare(lystream_headers
+        GIT_REPOSITORY https://github.com/PT233/lystream.git
+        GIT_TAG 7f12d207a7514863ac6d225c504a83409d17882c
+        SOURCE_SUBDIR headers_only)
+    FetchContent_MakeAvailable(lystream_headers)
+    set(LYSTREAM_SOURCE_DIR "${lystream_headers_SOURCE_DIR}")
+endif()
+if(NOT EXISTS "${LYSTREAM_SOURCE_DIR}/stream_control.h")
+    message(FATAL_ERROR "LYSTREAM_SOURCE_DIR must point to PT233/lystream")
+endif()
+
+find_package(Threads REQUIRED)
+add_executable(dual-hik-stitch src/main.cpp src/stitch.cpp src/lystream_port.cpp)
+set_target_properties(dual-hik-stitch PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+target_include_directories(dual-hik-stitch PRIVATE "${LYSTREAM_SOURCE_DIR}")
+target_link_libraries(dual-hik-stitch PRIVATE Threads::Threads)
+if(MSVC)
+    target_compile_options(dual-hik-stitch PRIVATE /W4)
+else()
+    target_compile_options(dual-hik-stitch PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+option(ENABLE_MVS "Build the Hikrobot industrial camera source" OFF)
+if(ENABLE_MVS)
+    set(MVS_ROOT "/opt/MVS" CACHE PATH "Hikrobot MVS SDK installation")
+    find_path(MVS_INCLUDE_DIR MvCameraControl.h HINTS "${MVS_ROOT}/include")
+    find_library(MVS_LIBRARY NAMES MvCameraControl
+        HINTS "${MVS_ROOT}/lib/aarch64" "${MVS_ROOT}/lib/64" "${MVS_ROOT}/lib")
+    if(NOT MVS_INCLUDE_DIR OR NOT MVS_LIBRARY)
+        message(FATAL_ERROR "Set MVS_ROOT or pass MVS_INCLUDE_DIR and MVS_LIBRARY explicitly")
+    endif()
+    target_sources(dual-hik-stitch PRIVATE src/mvs.cpp)
+    target_compile_definitions(dual-hik-stitch PRIVATE ENABLE_MVS)
+    target_include_directories(dual-hik-stitch SYSTEM PRIVATE "${MVS_INCLUDE_DIR}")
+    target_link_libraries(dual-hik-stitch PRIVATE "${MVS_LIBRARY}")
+endif()

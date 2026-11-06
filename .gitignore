@@ -1,0 +1,5 @@
+/build*/
+*.bgr
+*.mp4
+!demo/stitched.mp4
+*.ppm
