@@ -24,9 +24,10 @@ struct Options {
     bool list = false;
     bool require_bound_calibration = false;
     std::string left, right, trigger, left_profile, right_profile;
-    std::filesystem::path calibration, snapshot, output;
+    std::filesystem::path calibration, snapshot, output, trace_dir;
     int fps = 30;
     int frames = 0;
+    int check_pairs = 0;
     StitchOptions stitch;
     AutoExposure camera_auto_exposure = AutoExposure::profile;
     std::chrono::milliseconds write_timeout{2000};
@@ -43,6 +44,8 @@ void usage(std::ostream& out) {
            "  [--camera-timeout-ms N] [--pair-timeout-ms N] [--write-timeout-ms N (Linux)]\n"
            "  [--camera-auto-exposure off|once|continuous] (MVS sensor)\n"
            "  [--auto-exposure] [--auto-color] [--grayscale] (stitched video)\n"
+           "  [--check-pairs N (no video)] [--run-timeout-ms N]\n"
+           "  [--trace-dir NEW_DIRECTORY (bounded runs only)]\n"
            "  [--stitch-threads N] [--output FILE (default: raw BGR24 on stdout)]\n";
 }
 
@@ -84,9 +87,12 @@ Options parse(int argc, char** argv) {
         else if (flag == "--left-profile") options.left_profile = value();
         else if (flag == "--right-profile") options.right_profile = value();
         else if (flag == "--trigger") options.trigger = value();
-        else if (flag == "--calibration") options.calibration = value();
-        else if (flag == "--snapshot") options.snapshot = value();
-        else if (flag == "--output") options.output = value();
+        else if (flag == "--calibration") options.calibration = std::filesystem::u8path(value());
+        else if (flag == "--snapshot") options.snapshot = std::filesystem::u8path(value());
+        else if (flag == "--output") options.output = std::filesystem::u8path(value());
+        else if (flag == "--trace-dir") options.trace_dir = std::filesystem::u8path(value());
+        else if (flag == "--check-pairs") options.check_pairs = number(value(), 2, 100000);
+        else if (flag == "--run-timeout-ms") options.capture.run_timeout = std::chrono::milliseconds(number(value(), 200, 3600000));
         else if (flag == "--fps") options.fps = number(value(), 1, 240);
         else if (flag == "--frames") options.frames = number(value(), 1, 10000000);
         else if (flag == "--max-skew-ms") options.capture.max_skew = std::chrono::milliseconds(number(value(), 1, 1000));
@@ -118,6 +124,13 @@ Options parse(int argc, char** argv) {
     if (!options.snapshot.empty() && (options.stitch.auto_exposure || options.stitch.auto_color || options.stitch.grayscale)) {
         throw std::runtime_error("photometric output options require --calibration");
     }
+    if (options.check_pairs && (!options.snapshot.empty() || !options.output.empty() || options.frames)) {
+        throw std::runtime_error("--check-pairs uses --calibration and cannot take --output or --frames");
+    }
+    if (!options.trace_dir.empty() && !options.check_pairs && (options.frames == 0 || options.frames > 100000)) {
+        throw std::runtime_error("--trace-dir requires --check-pairs or --frames up to 100000");
+    }
+    if (options.check_pairs && options.capture.run_timeout.count() == 0) options.capture.run_timeout = 10000ms;
     return options;
 }
 
@@ -156,18 +169,77 @@ private:
 
 class StitchStream final : public lystream::StreamControl {
 public:
-    StitchStream(PairStream& source, Calibration calibration, RawOutput& output, StitchOptions options)
-        : StreamControl(&source), stitcher_(std::move(calibration), options), output_(output) {}
+    StitchStream(PairStream& source, Calibration calibration, RawOutput* output, StitchOptions options,
+                 std::ofstream* trace, bool check, bool device_clock)
+        : StreamControl(&source), stitcher_(std::move(calibration), options), output_(output),
+          trace_(trace), check_(check), device_clock_(device_clock) {}
+
+    std::uint64_t count() const { return count_; }
 
 private:
+    static auto micros(Clock::duration duration) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
+    }
+
+    void verify_pair(const Pair& pair) {
+        if (pair.epoch != 0) throw std::runtime_error("camera reconnected during self-check");
+        const Frame* cameras[] = {&pair.left, &pair.right};
+        for (std::size_t i = 0; i < 2; ++i) {
+            const auto& camera = *cameras[i];
+            if (!camera.sequence) throw std::runtime_error("camera sequence is unavailable during self-check");
+            if (last_sequence_[i]) {
+                const std::uint32_t advance = *camera.sequence - *last_sequence_[i];
+                if (advance == 0 || advance >= 0x80000000u || camera.source_pixel_type != pixel_type_[i]) {
+                    throw std::runtime_error("camera sequence regressed or pixel format changed during self-check");
+                }
+            }
+            last_sequence_[i] = camera.sequence;
+            pixel_type_[i] = camera.source_pixel_type;
+        }
+    }
+
+    void trace_camera(const Frame& frame, Clock::time_point paired) {
+        *trace_ << "{\"sequence\":";
+        if (frame.sequence) *trace_ << *frame.sequence;
+        else *trace_ << "null";
+        *trace_ << ",\"device_ticks\":\"" << frame.device_ticks << "\",\"receive_age_us\":"
+                << micros(paired - frame.received) << ",\"width\":" << frame.image.width
+                << ",\"height\":" << frame.image.height << ",\"source_pixel_type\":";
+        if (frame.source_pixel_type) *trace_ << *frame.source_pixel_type;
+        else *trace_ << "null";
+        *trace_ << '}';
+    }
+
     void DataTransferCall(void* data) override {
         const auto& pair = *static_cast<const Pair*>(data);
+        if (check_) verify_pair(pair);
+        const auto paired = Clock::now();
         const auto& image = stitcher_.stitch(pair.left.image, pair.right.image);
-        output_.write(image);
+        const auto stitched = Clock::now();
+        if (output_) output_->write(image);
+        const auto written = Clock::now();
+        ++count_;
+        if (!trace_) return;
+        *trace_ << "{\"pair_index\":" << count_ << ",\"epoch\":" << pair.epoch
+                << ",\"pair_monotonic_us\":" << micros(paired.time_since_epoch())
+                << ",\"pair_skew_us\":" << pair.skew_us << ",\"clock\":\"" << (device_clock_ ? "device" : "host")
+                << "\",\"stitch_us\":" << micros(stitched - paired) << ",\"write_us\":";
+        if (output_) *trace_ << micros(written - stitched);
+        else *trace_ << "null";
+        *trace_ << ",\"left\":";
+        trace_camera(pair.left, paired);
+        *trace_ << ",\"right\":";
+        trace_camera(pair.right, paired);
+        *trace_ << "}\n";
+        if (!*trace_) throw std::runtime_error("could not write frame trace");
     }
 
     Stitcher stitcher_;
-    RawOutput& output_;
+    RawOutput* output_;
+    std::ofstream* trace_;
+    bool check_, device_clock_;
+    std::uint64_t count_ = 0;
+    std::array<std::optional<std::uint32_t>, 2> last_sequence_{}, pixel_type_{};
 };
 
 void save_ppm(std::filesystem::path path, const Image& image) {
@@ -176,7 +248,7 @@ void save_ppm(std::filesystem::path path, const Image& image) {
     auto rgb = image.bgr;
     for (std::size_t i = 0; i < rgb.size(); i += 3) std::swap(rgb[i], rgb[i + 2]);
     out.write(reinterpret_cast<const char*>(rgb.data()), rgb.size()).flush();
-    if (!out) throw std::runtime_error("could not save " + path.string());
+    if (!out) throw std::runtime_error("could not save " + path.u8string());
 }
 
 void run(const Options& options) {
@@ -236,18 +308,39 @@ void run(const Options& options) {
         std::filesystem::equivalent(options.calibration, options.output)) {
         throw std::runtime_error("video output cannot overwrite the calibration file");
     }
-    RawOutput output(options.output, options.write_timeout);
+    std::ofstream trace;
+    if (!options.trace_dir.empty()) {
+        if (!std::filesystem::create_directory(options.trace_dir)) throw std::runtime_error("trace directory already exists");
+        const auto trace_file = options.trace_dir / "frames.jsonl";
+        trace.open(trace_file, std::ios::binary);
+        if (!trace) throw std::runtime_error("could not open frame trace");
+        if (!options.output.empty() && std::filesystem::exists(options.output) &&
+            std::filesystem::equivalent(trace_file, options.output)) {
+            throw std::runtime_error("video output cannot overwrite the frame trace");
+        }
+    }
+    std::optional<RawOutput> output;
+    if (!options.check_pairs) output.emplace(options.output, options.write_timeout);
     std::cerr << "output=bgr24 size=" << calibration.width << 'x' << calibration.height << '\n';
-    StitchStream stitch(source, std::move(calibration), output, options.stitch);
+    const auto width = calibration.width, height = calibration.height;
+    StitchStream stitch(source, std::move(calibration), output ? &*output : nullptr, options.stitch,
+                        trace.is_open() ? &trace : nullptr, options.check_pairs != 0, options.capture.device_clock_hz != 0);
     stitch.StartStream();
-    source.run(options.frames, stopped);
+    source.run(options.check_pairs ? options.check_pairs : options.frames, stopped);
     stitch.StopStream();
-    output.finish();
+    if (output) output->finish();
+    if (trace.is_open()) {
+        trace.close();
+        if (!trace) throw std::runtime_error("could not finalize frame trace");
+    }
+    if (options.check_pairs) {
+        if (stitch.count() != static_cast<std::uint64_t>(options.check_pairs)) throw std::runtime_error("self-check interrupted");
+        std::cout << "{\"status\":\"passed\",\"pairs\":" << stitch.count() << ",\"width\":" << width
+                  << ",\"height\":" << height << "}\n";
+    }
 }
 
-}  // namespace
-
-int main(int argc, char** argv) {
+int run_cli(int argc, char** argv) {
     if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
         usage(std::cout);
         return 0;
@@ -265,3 +358,19 @@ int main(int argc, char** argv) {
         return 1;
     }
 }
+
+}  // namespace
+
+#ifdef _WIN32
+int wmain(int argc, wchar_t** argv) {
+    std::vector<std::string> utf8;
+    utf8.reserve(argc);
+    for (int i = 0; i < argc; ++i) utf8.push_back(std::filesystem::path(argv[i]).u8string());
+    std::vector<char*> arguments;
+    arguments.reserve(argc);
+    for (auto& value : utf8) arguments.push_back(value.data());
+    return run_cli(argc, arguments.data());
+}
+#else
+int main(int argc, char** argv) { return run_cli(argc, argv); }
+#endif

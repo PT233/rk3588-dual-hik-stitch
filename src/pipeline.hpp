@@ -12,6 +12,8 @@
 struct Pair {
     Frame left;
     Frame right;
+    std::uint64_t epoch = 0;
+    std::int64_t skew_us = 0; // Signed left minus right in the selected pairing clock.
 };
 
 struct CapturePolicy {
@@ -19,6 +21,7 @@ struct CapturePolicy {
     std::chrono::milliseconds no_pair_timeout{10000};
     std::chrono::milliseconds camera_timeout{2000};
     std::chrono::milliseconds report_interval{5000};
+    std::chrono::milliseconds run_timeout{0};
     std::uint64_t device_clock_hz = 0;
 };
 

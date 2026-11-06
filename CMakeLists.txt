@@ -28,6 +28,9 @@ if(OpenMP_CXX_FOUND)
 endif()
 add_executable(dual-hik-stitch src/main.cpp)
 target_link_libraries(dual-hik-stitch PRIVATE stitch_core)
+if(MINGW)
+    target_link_options(dual-hik-stitch PRIVATE -municode)
+endif()
 
 function(enable_warnings target)
     if(MSVC)
@@ -56,7 +59,7 @@ endif()
 
 include(GNUInstallDirs)
 install(TARGETS dual-hik-stitch RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
-install(PROGRAMS deploy/run-rtsp.sh DESTINATION "${CMAKE_INSTALL_LIBEXECDIR}/dual-hik-stitch")
+install(PROGRAMS deploy/run-rtsp.sh tools/board_baseline.py DESTINATION "${CMAKE_INSTALL_LIBEXECDIR}/dual-hik-stitch")
 
 include(CTest)
 if(BUILD_TESTING)
@@ -69,6 +72,14 @@ if(BUILD_TESTING)
         -DWORK=${CMAKE_CURRENT_BINARY_DIR} -DPARALLEL=${OpenMP_CXX_FOUND}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke.cmake)
     set_tests_properties(recovery_and_output synthetic_cli PROPERTIES TIMEOUT 15)
+    find_package(Python3 QUIET COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME camera_baseline COMMAND ${CMAKE_COMMAND}
+            -DAPP=$<TARGET_FILE:dual-hik-stitch> -DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}
+            -DWORK=${CMAKE_CURRENT_BINARY_DIR} -DPYTHON=${Python3_EXECUTABLE}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/baseline.cmake)
+        set_tests_properties(camera_baseline PROPERTIES TIMEOUT 15)
+    endif()
     if(UNIX)
         add_test(NAME rtsp_supervisor COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/supervisor.sh
             ${CMAKE_CURRENT_SOURCE_DIR}/deploy/run-rtsp.sh)

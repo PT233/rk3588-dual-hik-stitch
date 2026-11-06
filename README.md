@@ -87,3 +87,29 @@ RTSP 服务通过 `CAMERA_AUTO_EXPOSURE`、`AUTO_EXPOSURE`、`AUTO_COLOR` 和 `G
 1. 分别跑单路采集，再跑双路采集。用移动标靶穿过接缝，测对齐误差、曝光偏差、配对帧率和掉帧。切换到目标编码配置后复测端到端延迟、CPU、内存和温度。
 2. 拔插单台相机、停止 RTSP 接收端、暂停编码进程并重启板卡。逐项记录恢复时间，检查恢复后的首对帧、丢帧计数和日志，确认恢复前后的帧没有被配到同一对。
 3. 在目标工况长跑，例如 72 小时。根据现场事先确定的帧率、延迟、接缝误差和恢复时间阈值出验收报告。当前仓库的自动测试覆盖模拟配对、恢复、输出和并行拼接，真机采集与硬编码仍需要上述验收。
+
+## 双摄自检、逐帧追溯与基线
+
+自检 `--check-pairs N` 实际读取、配对和拼接 N 对图像。相机帧号必须向前推进，源格式和图像尺寸保持一致，标定必须可用。期间发生重连、总超时或采集未完成均返回非零。自检只在标准输出写一条 JSON 结果。真实相机自检会独占相机，请在服务启动前或停服窗口运行。
+
+可通过 `--trace-dir NEW_DIRECTORY` 为有限帧数的自检或普通输出生成 `frames.jsonl`。每行对应一对图像，记录左右帧号、设备原始 tick、SDK 源像素格式、配对所用时钟域及时间差、重连代号、图像从主机收帧到被取用的年龄、拼接耗时和输出写入耗时。自检未写出视频，`write_us` 为 `null`。这些记录能定位采集和拼接，RTSP 解码检查是独立测量，当前无法将接收端的一帧反查到某对源帧。
+
+`tools/board_baseline.py` 需要 Python 3 标准库。用新目录存放证据，工具会保留相机日志、逐帧记录、标定输入与哈希、运行结果和 P50/P95/P99。Linux 上还会按秒记录可读取的进程 CPU 时间、RSS 和板端温度。失败也会留下结果和已产生的记录。
+
+```sh
+# 无实物时验证软件流程，报告标明 synthetic。
+python3 tools/board_baseline.py capture --app ./build/dual-hik-stitch \
+  --calibration config/synthetic.calib --out baseline-synthetic \
+  --frames 90 --warmup 5 -- --synthetic
+
+# 将序列号、标定和同步选项换成实际工位值。
+python3 tools/board_baseline.py capture --app ./build-mvs/dual-hik-stitch \
+  --calibration site.calib --out baseline-camera --frames 90 --warmup 5 -- \
+  --left LEFT_SERIAL --right RIGHT_SERIAL --require-bound-calibration
+
+# 服务已运行时，从接收端验证能连续解码指定数量的视频帧。
+python3 tools/board_baseline.py rtsp --url rtsp://127.0.0.1:8554/stitch \
+  --out baseline-rtsp --frames 90 --timeout 20
+```
+
+自检报告中的收帧年龄从主机取到帧开始计时，配对时差也不等于两台相机的光学曝光偏差。RTSP 报告的耗时包含连接和解码，不是端到端图龄。对照性能时使用相同配置及帧数，保留预热帧的记录，并在结论里注明测量时钟和窗口。

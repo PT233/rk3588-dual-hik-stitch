@@ -93,7 +93,7 @@ Calibration load_calibration(const std::filesystem::path& path) {
         calibration.height > 8192 || static_cast<long long>(calibration.width) * calibration.height > 16777216 ||
         std::abs(static_cast<double>(calibration.left_x)) > 8192 ||
         std::abs(static_cast<double>(calibration.left_y)) > 8192) {
-        throw std::runtime_error("invalid calibration canvas in " + path.string());
+        throw std::runtime_error("invalid calibration canvas in " + path.u8string());
     }
 
     std::array<Equation, 8> system{};

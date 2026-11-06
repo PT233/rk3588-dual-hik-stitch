@@ -119,6 +119,7 @@ public:
         const auto& info = buffer.frame.stFrameInfo;
         const auto ticks = (static_cast<std::uint64_t>(info.nDevTimeStampHigh) << 32) | info.nDevTimeStampLow;
         const auto sequence = info.nFrameNum;
+        const auto pixel_type = static_cast<std::uint32_t>(info.enPixelType);
         if (info.nLostPacket) return Frame{{}, received, ticks, sequence, info.nLostPacket};
         const auto pixels = static_cast<std::uint64_t>(info.nWidth) * info.nHeight;
         if (info.nWidth == 0 || info.nHeight == 0 || info.nWidth > 8192 || info.nHeight > 8192 ||
@@ -152,7 +153,7 @@ public:
         const auto release = MV_CC_FreeImageBuffer(session_.handle, &buffer.frame);
         buffer.acquired = false;
         check(release, serial_ + ": release image", true);
-        return Frame{std::move(image), received, ticks, sequence, 0};
+        return Frame{std::move(image), received, ticks, sequence, 0, pixel_type};
     }
 
 private:

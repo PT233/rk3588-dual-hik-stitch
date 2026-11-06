@@ -22,6 +22,7 @@ struct Frame {
     std::uint64_t device_ticks = 0;
     std::optional<std::uint32_t> sequence;
     std::uint32_t lost_packets = 0;
+    std::optional<std::uint32_t> source_pixel_type{};
 };
 
 class CameraUnavailable : public std::runtime_error {

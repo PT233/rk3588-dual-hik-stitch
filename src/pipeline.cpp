@@ -25,6 +25,11 @@ void PairStream::run(std::uint64_t limit, const std::function<bool()>& stop_requ
     if (!isrun_ || stopping_) throw std::logic_error("PairStream must be started and can run only once");
     started_ = Clock::now();
     std::array<std::thread, 2> workers;
+    const auto check_deadline = [&] {
+        if (policy_.run_timeout.count() > 0 && Clock::now() - started_ >= policy_.run_timeout) {
+            throw std::runtime_error("capture run deadline exceeded");
+        }
+    };
     const auto join = [&] {
         stopping_ = true;
         ready_.notify_all();
@@ -39,6 +44,7 @@ void PairStream::run(std::uint64_t limit, const std::function<bool()>& stop_requ
         auto next_report = last_pair + policy_.report_interval;
         while (!stop_requested() && isrun_ && (limit == 0 || emitted_ < limit)) {
             if (auto pair = next_pair()) {
+                check_deadline();
                 last_pair = Clock::now();
                 for (const auto& output : ondata_list_) output(&*pair);
                 ++emitted_;
@@ -47,6 +53,7 @@ void PairStream::run(std::uint64_t limit, const std::function<bool()>& stop_requ
             } else if (!stop_requested() && Clock::now() - last_pair >= policy_.no_pair_timeout) {
                 throw std::runtime_error("frame pair timeout; check camera status and timestamp configuration");
             }
+            check_deadline();
             if (Clock::now() >= next_report) {
                 report();
                 next_report = Clock::now() + policy_.report_interval;
@@ -168,7 +175,7 @@ std::optional<Pair> PairStream::next_pair() {
             ++inputs_[0].skew_dropped;
         } else {
             max_skew_us_ = std::max(max_skew_us_, difference < 0 ? -difference : difference);
-            Pair pair{std::move(left.front()), std::move(right.front())};
+            Pair pair{std::move(left.front()), std::move(right.front()), epoch_, difference};
             left.pop_front();
             right.pop_front();
             return pair;
