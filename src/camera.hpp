@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -18,6 +19,14 @@ struct Image {
 struct Frame {
     Image image;
     Clock::time_point received;
+    std::uint64_t device_ticks = 0;
+    std::optional<std::uint32_t> sequence;
+    std::uint32_t lost_packets = 0;
+};
+
+class CameraUnavailable : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
 };
 
 class Camera {
@@ -36,5 +45,6 @@ public:
 };
 
 void list_mvs_cameras();
-std::unique_ptr<Camera> open_mvs_camera(const std::string& serial, const std::string& trigger);
+std::unique_ptr<Camera> open_mvs_camera(const std::string& serial, const std::string& trigger,
+                                       std::uint64_t device_clock_hz, const std::string& profile);
 #endif

@@ -1,23 +1,16 @@
 #include "camera.hpp"
+#include "pipeline.hpp"
+#include "raw_output.hpp"
 #include "stitch.hpp"
 #include "stream_control.h"
 
-#include <atomic>
 #include <charconv>
-#include <condition_variable>
 #include <csignal>
-#include <cstdio>
-#include <deque>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
-
-#ifdef _WIN32
-#include <fcntl.h>
-#include <io.h>
-#endif
 
 namespace {
 
@@ -29,19 +22,25 @@ void interrupt(int) { interrupted = 1; }
 struct Options {
     bool synthetic = false;
     bool list = false;
-    std::string left, right, trigger;
+    bool require_bound_calibration = false;
+    std::string left, right, trigger, left_profile, right_profile;
     std::filesystem::path calibration, snapshot, output;
     int fps = 30;
     int frames = 0;
-    int max_skew_ms = 15;
+    int stitch_threads = 1;
+    std::chrono::milliseconds write_timeout{2000};
+    CapturePolicy capture;
 };
 
 void usage(std::ostream& out) {
     out << "dual-hik-stitch --list\n"
            "dual-hik-stitch --left SERIAL --right SERIAL --snapshot PREFIX\n"
            "dual-hik-stitch (--synthetic | --left SERIAL --right SERIAL) --calibration FILE\n"
-           "  [--frames N] [--fps N (synthetic source)] [--max-skew-ms N]\n"
-           "  [--trigger Line0] [--output FILE (default: raw BGR24 on stdout)]\n";
+           "  [--frames N] [--fps N (synthetic source)] [--max-skew-ms N | --max-skew-us N]\n"
+           "  [--trigger Line0] [--device-clock-hz N (PTP GigE)] [--require-bound-calibration]\n"
+           "  [--left-profile FILE] [--right-profile FILE] (MVS feature files)\n"
+           "  [--camera-timeout-ms N] [--pair-timeout-ms N] [--write-timeout-ms N (Linux)]\n"
+           "  [--stitch-threads N] [--output FILE (default: raw BGR24 on stdout)]\n";
 }
 
 int number(std::string_view value, int minimum, int maximum) {
@@ -66,22 +65,32 @@ Options parse(int argc, char** argv) {
         };
         if (flag == "--synthetic") options.synthetic = true;
         else if (flag == "--list") options.list = true;
+        else if (flag == "--require-bound-calibration") options.require_bound_calibration = true;
         else if (flag == "--left") options.left = value();
         else if (flag == "--right") options.right = value();
+        else if (flag == "--left-profile") options.left_profile = value();
+        else if (flag == "--right-profile") options.right_profile = value();
         else if (flag == "--trigger") options.trigger = value();
         else if (flag == "--calibration") options.calibration = value();
         else if (flag == "--snapshot") options.snapshot = value();
         else if (flag == "--output") options.output = value();
         else if (flag == "--fps") options.fps = number(value(), 1, 240);
         else if (flag == "--frames") options.frames = number(value(), 1, 10000000);
-        else if (flag == "--max-skew-ms") options.max_skew_ms = number(value(), 1, 1000);
+        else if (flag == "--max-skew-ms") options.capture.max_skew = std::chrono::milliseconds(number(value(), 1, 1000));
+        else if (flag == "--max-skew-us") options.capture.max_skew = std::chrono::microseconds(number(value(), 1, 1000000));
+        else if (flag == "--camera-timeout-ms") options.capture.camera_timeout = std::chrono::milliseconds(number(value(), 200, 300000));
+        else if (flag == "--pair-timeout-ms") options.capture.no_pair_timeout = std::chrono::milliseconds(number(value(), 200, 300000));
+        else if (flag == "--write-timeout-ms") options.write_timeout = std::chrono::milliseconds(number(value(), 10, 30000));
+        else if (flag == "--device-clock-hz") options.capture.device_clock_hz = number(value(), 1, 2000000000);
+        else if (flag == "--stitch-threads") options.stitch_threads = number(value(), 1, 8);
         else throw std::runtime_error("unknown option: " + std::string(flag));
     }
     if (options.list && argc != 2) throw std::runtime_error("--list must be used alone");
     if (options.list) return options;
     if (options.synthetic) {
-        if (!options.left.empty() || !options.right.empty() || !options.trigger.empty()) {
-            throw std::runtime_error("--synthetic cannot take camera serials or trigger settings");
+        if (!options.left.empty() || !options.right.empty() || !options.trigger.empty() || options.capture.device_clock_hz ||
+            !options.left_profile.empty() || !options.right_profile.empty()) {
+            throw std::runtime_error("--synthetic cannot take MVS camera settings");
         }
     } else if (options.left.empty() || options.right.empty() || options.left == options.right) {
         throw std::runtime_error("provide two distinct camera serials or use --synthetic");
@@ -89,8 +98,8 @@ Options parse(int argc, char** argv) {
     if (options.calibration.empty() == options.snapshot.empty()) {
         throw std::runtime_error("provide exactly one of --snapshot or --calibration");
     }
-    if (!options.snapshot.empty() && (!options.output.empty() || options.frames != 0)) {
-        throw std::runtime_error("--snapshot cannot take --output or --frames");
+    if (!options.snapshot.empty() && (!options.output.empty() || options.frames != 0 || options.require_bound_calibration)) {
+        throw std::runtime_error("--snapshot cannot take --output, --frames or --require-bound-calibration");
     }
     return options;
 }
@@ -118,7 +127,7 @@ public:
             }
         }
         ++index_;
-        return Frame{std::move(image), timestamp};
+        return Frame{std::move(image), timestamp, 0, static_cast<std::uint32_t>(index_), 0};
     }
 
 private:
@@ -128,124 +137,20 @@ private:
     long long index_ = 0;
 };
 
-struct Pair {
-    Frame left, right;
-};
-
-class PairStream final : public lystream::Stream {
-public:
-    PairStream(std::unique_ptr<Camera> left, std::unique_ptr<Camera> right, int max_skew_ms)
-        : cameras_{std::move(left), std::move(right)}, max_skew_(max_skew_ms) {}
-
-    void StartStream() override { isrun_ = ++stream_para_.ref_count > 0; }
-    void StopStream() override {
-        if (stream_para_.ref_count > 0) isrun_ = --stream_para_.ref_count > 0;
-    }
-
-    void run(int limit) {
-        std::thread left, right;
-        const auto join = [&] {
-            stop_capture_ = true;
-            if (left.joinable()) left.join();
-            if (right.joinable()) right.join();
-        };
-        try {
-            left = std::thread([this] { capture(0); });
-            right = std::thread([this] { capture(1); });
-            auto last_pair = Clock::now();
-            while (!interrupted && isrun_ && (limit == 0 || emitted_ < limit)) {
-                if (auto pair = next_pair()) {
-                    last_pair = Clock::now();
-                    for (const auto& output : ondata_list_) output(&*pair);
-                    ++emitted_;
-                } else if (Clock::now() - last_pair > 10s) {
-                    throw std::runtime_error("no frame pair for 10 seconds; check camera streams, trigger and skew");
-                }
-            }
-        } catch (...) {
-            join();
-            throw;
-        }
-        join();
-        std::cerr << "paired=" << emitted_ << " skew_dropped=" << skew_dropped_
-                  << " queue_dropped=" << queue_dropped_ << '\n';
-    }
-
-private:
-    void capture(std::size_t side) {
-        try {
-            while (!stop_capture_) {
-                auto frame = cameras_[side]->read();
-                if (!frame || stop_capture_) continue;
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    auto& queue = queues_[side];
-                    if (queue.size() >= 4) {
-                        queue.pop_front();
-                        ++queue_dropped_;
-                    }
-                    queue.push_back(std::move(*frame));
-                }
-                ready_.notify_one();
-            }
-        } catch (...) {
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                if (!error_) error_ = std::current_exception();
-            }
-            ready_.notify_one();
-        }
-    }
-
-    std::optional<Pair> next_pair() {
-        std::unique_lock<std::mutex> lock(mutex_);
-        auto& left = queues_[0];
-        auto& right = queues_[1];
-        ready_.wait_for(lock, 100ms, [&] { return error_ || (!left.empty() && !right.empty()); });
-        if (error_) std::rethrow_exception(error_);
-        while (!left.empty() && !right.empty()) {
-            const auto difference = left.front().received - right.front().received;
-            if (difference > max_skew_) right.pop_front();
-            else if (difference < -max_skew_) left.pop_front();
-            else {
-                Pair pair{std::move(left.front()), std::move(right.front())};
-                left.pop_front();
-                right.pop_front();
-                return pair;
-            }
-            ++skew_dropped_;
-        }
-        return std::nullopt;
-    }
-
-    std::unique_ptr<Camera> cameras_[2];
-    std::chrono::milliseconds max_skew_;
-    std::atomic<bool> stop_capture_{false};
-    std::mutex mutex_;
-    std::condition_variable ready_;
-    std::deque<Frame> queues_[2];
-    std::exception_ptr error_;
-    int emitted_ = 0;
-    std::uint64_t skew_dropped_ = 0;
-    std::uint64_t queue_dropped_ = 0;
-};
-
 class StitchStream final : public lystream::StreamControl {
 public:
-    StitchStream(PairStream& source, Calibration calibration, std::ostream& output)
-        : StreamControl(&source), stitcher_(calibration), output_(output) {}
+    StitchStream(PairStream& source, Calibration calibration, RawOutput& output, int threads)
+        : StreamControl(&source), stitcher_(std::move(calibration), threads), output_(output) {}
 
 private:
     void DataTransferCall(void* data) override {
         const auto& pair = *static_cast<const Pair*>(data);
         const auto& image = stitcher_.stitch(pair.left.image, pair.right.image);
-        if (!output_.write(reinterpret_cast<const char*>(image.bgr.data()), image.bgr.size())) {
-            throw std::runtime_error("could not write the stitched video frame");
-        }
+        output_.write(image);
     }
 
     Stitcher stitcher_;
-    std::ostream& output_;
+    RawOutput& output_;
 };
 
 void save_ppm(std::filesystem::path path, const Image& image) {
@@ -269,20 +174,25 @@ void run(const Options& options) {
     if (!options.synthetic) throw std::runtime_error("build with -DENABLE_MVS=ON to use real cameras");
 #endif
 
-    std::unique_ptr<Camera> left, right;
+    std::array<PairStream::CameraFactory, 2> cameras;
     if (options.synthetic) {
         const auto start = Clock::now() + 150ms;
-        left = std::make_unique<SyntheticCamera>(false, options.fps, start);
-        right = std::make_unique<SyntheticCamera>(true, options.fps, start);
+        cameras[0] = [fps = options.fps, start] { return std::make_unique<SyntheticCamera>(false, fps, start); };
+        cameras[1] = [fps = options.fps, start] { return std::make_unique<SyntheticCamera>(true, fps, start); };
     }
 #ifdef ENABLE_MVS
     else {
-        left = open_mvs_camera(options.left, options.trigger);
-        right = open_mvs_camera(options.right, options.trigger);
+        cameras[0] = [&] {
+            return open_mvs_camera(options.left, options.trigger, options.capture.device_clock_hz, options.left_profile);
+        };
+        cameras[1] = [&] {
+            return open_mvs_camera(options.right, options.trigger, options.capture.device_clock_hz, options.right_profile);
+        };
     }
 #endif
 
-    PairStream source(std::move(left), std::move(right), options.max_skew_ms);
+    PairStream source(std::move(cameras), options.capture);
+    const auto stopped = [] { return interrupted != 0; };
     if (!options.snapshot.empty()) {
         source.DataTransfer([&](void* data) {
             const auto& pair = *static_cast<const Pair*>(data);
@@ -290,29 +200,30 @@ void run(const Options& options) {
             save_ppm(std::filesystem::path(options.snapshot).concat("-right.ppm"), pair.right.image);
         });
         source.StartStream();
-        source.run(1);
+        source.run(1, stopped);
         source.StopStream();
         return;
     }
 
-    const auto calibration = load_calibration(options.calibration);
-    std::ofstream file;
-    if (!options.output.empty()) {
-        file.open(options.output, std::ios::binary);
-        if (!file) throw std::runtime_error("could not open output file");
+    auto calibration = load_calibration(options.calibration);
+    if (options.require_bound_calibration && !calibration.binding) {
+        throw std::runtime_error("calibration must include the camera serials and dimensions");
     }
-#ifdef _WIN32
-    else if (_setmode(_fileno(stdout), _O_BINARY) < 0) {
-        throw std::runtime_error("could not set stdout binary mode");
+    if (calibration.binding && (calibration.binding->left_serial != options.left ||
+                                calibration.binding->right_serial != options.right)) {
+        throw std::runtime_error("calibration camera serials do not match the selected cameras");
     }
-#endif
-    auto& output = options.output.empty() ? std::cout : static_cast<std::ostream&>(file);
+    if (!options.output.empty() && std::filesystem::exists(options.output) &&
+        std::filesystem::equivalent(options.calibration, options.output)) {
+        throw std::runtime_error("video output cannot overwrite the calibration file");
+    }
+    RawOutput output(options.output, options.write_timeout);
     std::cerr << "output=bgr24 size=" << calibration.width << 'x' << calibration.height << '\n';
-    StitchStream stitch(source, calibration, output);
+    StitchStream stitch(source, std::move(calibration), output, options.stitch_threads);
     stitch.StartStream();
-    source.run(options.frames);
+    source.run(options.frames, stopped);
     stitch.StopStream();
-    if (!output.flush()) throw std::runtime_error("could not flush the stitched video");
+    output.finish();
 }
 
 }  // namespace

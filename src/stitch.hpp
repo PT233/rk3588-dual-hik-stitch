@@ -6,18 +6,25 @@
 #include <filesystem>
 
 struct Calibration {
+    struct Binding {
+        std::string left_serial, right_serial;
+        std::array<int, 4> sizes{};
+    };
+
     int width;
     int height;
     int left_x;
     int left_y;
     std::array<double, 8> right_from_canvas;
+    std::array<int, 4> minimum_input_sizes{};
+    std::optional<Binding> binding;
 };
 
 Calibration load_calibration(const std::filesystem::path& path);
 
 class Stitcher {
 public:
-    explicit Stitcher(Calibration calibration);
+    explicit Stitcher(Calibration calibration, int threads = 1);
     const Image& stitch(const Image& left, const Image& right);
 
 private:
@@ -30,6 +37,7 @@ private:
     void prepare(const Image& left, const Image& right);
 
     Calibration calibration_;
+    int threads_;
     std::array<int, 4> source_sizes_{};
     std::vector<Pixel> map_;
     Image result_;

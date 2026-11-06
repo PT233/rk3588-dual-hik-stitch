@@ -2,7 +2,7 @@
 
 两台固定安装、有重叠视野的海康机器人面阵相机分别采集左右画面。程序配对双路帧，用单应矩阵把右图映射到左图坐标系，对重叠区域做加权融合，输出一条视频流。适合从固定平面观察产线、传送带或工装。场景深度差越大，越容易在接缝看到视差。
 
-`PairStream` 和 `StitchStream` 使用 [lystream 的 `Stream` / `StreamControl` 接口](https://github.com/PT233/lystream/tree/7f12d207a7514863ac6d225c504a83409d17882c)，实现保存在 `src/lystream_port.cpp`，可在无 CUDA 的机器上构建。每路采集独占一个线程，队列各最多保留四帧。默认按主机收帧时间配对，超过 15 ms 时丢弃较旧帧。配对、超差丢帧和队列溢出计数打印到标准错误。
+`PairStream` 和 `StitchStream` 使用 lystream 的 `Stream` / `StreamControl`，可在无 CUDA 的机器上构建。每路相机独占一个采集线程，队列各最多保留四帧。默认按主机收帧时间配对，超过 15 ms 时丢弃较旧帧。每 5 秒输出配对数、运行时长、最大配对时间差、拼接与写出合计最长耗时，以及各路收帧、坏帧、帧号缺口、队列溢出、超差丢帧和重连次数。[lystream 接口源码](https://github.com/PT233/lystream/tree/7f12d207a7514863ac6d225c504a83409d17882c)
 
 ## 模拟双摄
 
@@ -13,6 +13,7 @@
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
 ./build/dual-hik-stitch --synthetic --calibration config/synthetic.calib \
   --frames 120 --output stitched.bgr
 ffmpeg -f rawvideo -pixel_format bgr24 -video_size 1152x352 -framerate 30 \
@@ -32,7 +33,7 @@ cmake --build build-mvs
 ./build-mvs/dual-hik-stitch --left LEFT_SERIAL --right RIGHT_SERIAL --snapshot calibration
 ```
 
-如 SDK 安装布局不同，传入 `-DMVS_INCLUDE_DIR=...` 和 `-DMVS_LIBRARY=...`。运行时需让系统动态加载器能找到 MVS 库及其依赖。`--list` 输出序列号、接口和型号。左右相机按序列号绑定，`--snapshot` 会保存一对原尺寸 PPM 图用于取点。
+如 SDK 安装布局不同，传入 `-DMVS_INCLUDE_DIR=...` 和 `-DMVS_LIBRARY=...`。运行时需让系统动态加载器能找到 MVS 库及其依赖。`--list` 输出序列号、接口和型号。左右相机按序列号绑定，`--snapshot` 会保存一对原尺寸 PPM 图用于取点。可用 `--left-profile` 和 `--right-profile` 指定对应相机导出的 MVS 参数文件，首次打开和断线重连时都会重新加载，再应用命令行指定的触发设置。
 
 把棋盘格或其他平面标靶放在两台相机的重叠区域。在两张原图上选出相同的四个物理点，尽量分布到重叠区四周。保存为 `site.calib`，格式如下。首行是拼接输出宽、高、左图在输出画布中的 X/Y 原点，后四行是 `左图X 左图Y 右图X 右图Y`。以下数字来自模拟相机，实机要按现场重新测量。输出宽高取偶数，便于编码为 YUV 4:2:0。
 
@@ -44,6 +45,8 @@ cmake --build build-mvs
 620 320 108 328
 ```
 
+正式部署在最后加一行 `cameras LEFT_SERIAL LEFT_WIDTH LEFT_HEIGHT RIGHT_SERIAL RIGHT_WIDTH RIGHT_HEIGHT`，把标定绑定到相机序列号及原始图像尺寸。部署脚本会要求这行。调整相机 ROI、镜头或机位后要复核标定，同尺寸的 ROI 偏移不会自动识别。
+
 按实测输出尺寸和采集帧率修改下面的 `-video_size` 和 `-framerate`。`--frames 300` 录制 300 张成功配对的拼接帧。去掉该选项后可持续运行，`Ctrl+C` 停止。只想实时预览时，可把 FFmpeg 换成 FFplay 并保留相同的 rawvideo 输入参数。
 
 ```sh
@@ -54,10 +57,20 @@ set -o pipefail
     -i pipe:0 -an -c:v libx264 -pix_fmt yuv420p stitched.mp4
 ```
 
-RK3588 的 FFmpeg 若包含 `h264_rkmpp`，可把编码参数换成 `-vf format=nv12 -c:v h264_rkmpp -b:v 4M`。先用 `ffmpeg -encoders` 核对编码器。编码与拼接是两段独立处理，当前几何拼接在 CPU 上运行。[Rockchip FFmpeg 编码器文档](https://github.com/nyanmisaka/ffmpeg-rockchip/wiki/Encoder)
+RK3588 的 FFmpeg 若包含 `h264_rkmpp`，可把编码参数换成 `-vf format=nv12 -c:v h264_rkmpp -b:v 4M`。先用 `ffmpeg -encoders` 核对编码器。几何拼接在 CPU 上运行，构建找到 OpenMP 时可用 `--stitch-threads 2` 或 `4`，实测后选择线程数。[Rockchip FFmpeg 编码器文档](https://github.com/nyanmisaka/ffmpeg-rockchip/wiki/Encoder)
+
+## Linux 服务部署
+
+将含 MVS 的构建用 `sudo cmake --install build-mvs --prefix /usr/local` 安装。创建 `dualhik` 服务账户，按板厂和海康 SDK 的要求为该账户配置相机与编码设备访问权限。将 `deploy/dual-hik-stitch.service` 安装到 `/etc/systemd/system/`，将 `deploy/service.env.example` 复制为 `/etc/dual-hik-stitch/service.env` 并填写双摄序列号、现场标定和 RTSP 发布地址。RTSP 接收服务须事先启动，例如同板上的 MediaMTX。需要定制安装路径时同步修改服务文件和 `CAPTURE_BIN`。完成后可用 `sudo systemctl daemon-reload`、`sudo systemctl enable --now dual-hik-stitch` 和 `journalctl -u dual-hik-stitch -f` 部署和查看状态。
+
+相机临时中断时，程序清空两路待配对帧并按 250 ms 到 4 秒的退避间隔重试。长时间无法成对、Linux 管道超时或编码进程退出时，由 systemd 重启采集和推流。服务示例中分别配置单路无帧、双路无配对和写入超时。硬触发间隔较长时，要把两项采集超时设得比现场最大间隔长。RTSP 的时间戳使用编码端接收时钟，适用于实时预览。用 CLI 输出 BGR 文件时，FFmpeg 仍按指定的固定帧率生成时间戳。两种输出都需另行验证业务要求的精确曝光时间追溯。
 
 ## 同步与验收
 
-运动目标跨接缝时，可给两台相机接同一个触发信号，并传 `--trigger Line0`。触发线及 `FrameStart` 节点需按相机型号确认。当前程序仍以主机收帧时间配对，同一触发边沿是否匹配、实际曝光偏差、GigE 传输抖动和拼接帧率都需要实测。标准输出是 BGR24 裸流，FFmpeg 按指定固定帧率生成时间戳。若采集掉帧，录像播放时长会与采集时长不同。
+运动目标跨接缝时，可给两台相机接同一个触发信号，并传 `--trigger Line0`。触发线及 `FrameStart` 节点需按相机型号确认。支持 `GevIEEE1588` 和 `GevIEEE1588Status` 的 GigE 相机可在现场配置并验证同一 PTP 时钟域，再传 `--device-clock-hz` 和 `--max-skew-us`。程序会核对两台相机的 tick 频率，定期检查 PTP 状态，使用设备时间戳配对。`Master`/`Slave` 状态用于检查相机是否进入工作状态，同一时钟域及实际曝光偏差需用设备诊断和标靶复核。配对窗口应小于半个触发周期，并满足现场误差要求。主机时间模式用于调试或允许更大时差的场景。[海康 GigE 相机手册](https://www.hikrobotics.com/en2/source/vision/document/2023/12/19/UD34944B_GigE%20Area%20Scan%20Camera%20User%20Manual_V4.0.0_20231214.pdf)
 
-实机先验证两张标定图的公共直线能接上，再用移动标靶穿过接缝，检查错位和重影。记录板端配对帧率、两类丢帧计数和 CPU 占用。连续 10 秒没有配对帧时程序退出并提示排查相机、触发和允许时差。
+按以下顺序验收实板，记录板型、BSP、MVS 版本、相机型号、ROI、像素格式、帧率和网口拓扑。
+
+1. 分别跑单路采集，再跑双路采集。用移动标靶穿过接缝，测对齐误差、曝光偏差、配对帧率和掉帧。切换到目标编码配置后复测端到端延迟、CPU、内存和温度。
+2. 拔插单台相机、停止 RTSP 接收端、暂停编码进程并重启板卡。逐项记录恢复时间，检查恢复后的首对帧、丢帧计数和日志，确认恢复前后的帧没有被配到同一对。
+3. 在目标工况长跑，例如 72 小时。根据现场事先确定的帧率、延迟、接缝误差和恢复时间阈值出验收报告。当前仓库的自动测试覆盖模拟配对、恢复、输出和并行拼接，真机采集与硬编码仍需要上述验收。

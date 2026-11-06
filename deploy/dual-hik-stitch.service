@@ -1,0 +1,27 @@
+[Unit]
+Description=Dual Hikrobot camera stitcher and RTSP publisher
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=dualhik
+EnvironmentFile=/etc/dual-hik-stitch/service.env
+ExecStart=/usr/local/libexec/dual-hik-stitch/run-rtsp.sh
+RuntimeDirectory=dual-hik-stitch
+RuntimeDirectoryMode=0750
+StateDirectory=dual-hik-stitch
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/dual-hik-stitch
+Restart=on-failure
+RestartSec=5s
+KillMode=control-group
+TimeoutStopSec=8s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

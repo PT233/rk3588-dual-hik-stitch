@@ -4,21 +4,23 @@
 
 #include <algorithm>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 
 namespace {
 
-void check(int status, const std::string& action) {
+void check(int status, const std::string& action, bool retryable = false) {
     if (status == MV_OK) return;
     std::ostringstream message;
     message << action << " failed (MVS 0x" << std::hex << static_cast<std::uint32_t>(status) << ')';
+    if (retryable) throw CameraUnavailable(message.str());
     throw std::runtime_error(message.str());
 }
 
 MV_CC_DEVICE_INFO_LIST enumerate() {
     MV_CC_DEVICE_INFO_LIST devices{};
-    check(MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, &devices), "enumerate cameras");
+    check(MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, &devices), "enumerate cameras", true);
     return devices;
 }
 
@@ -57,11 +59,27 @@ struct Buffer {
 
 class MvsCamera final : public Camera {
 public:
-    MvsCamera(MV_CC_DEVICE_INFO* device, std::string serial_number, const std::string& trigger)
-        : serial_(std::move(serial_number)) {
-        check(MV_CC_CreateHandle(&session_.handle, device), serial_ + ": create handle");
-        check(MV_CC_OpenDevice(session_.handle, MV_ACCESS_Exclusive, 0), serial_ + ": open camera");
+    MvsCamera(MV_CC_DEVICE_INFO* device, std::string serial_number, const std::string& trigger,
+              std::uint64_t device_clock_hz, const std::string& profile)
+        : serial_(std::move(serial_number)), device_clock_hz_(device_clock_hz) {
+        check(MV_CC_CreateHandle(&session_.handle, device), serial_ + ": create handle", true);
+        check(MV_CC_OpenDevice(session_.handle, MV_ACCESS_Exclusive, 0), serial_ + ": open camera", true);
         session_.opened = true;
+        if (!profile.empty()) {
+            check(MV_CC_FeatureLoad(session_.handle, profile.c_str()), serial_ + ": apply camera profile");
+        }
+
+        if (device_clock_hz_) {
+            if (device->nTLayerType != MV_GIGE_DEVICE) throw std::runtime_error("PTP mode requires GigE cameras");
+            MVCC_INTVALUE_EX frequency{};
+            check(MV_CC_GetIntValueEx(session_.handle, "GevTimestampTickFrequency", &frequency), serial_ + ": read tick frequency");
+            if (frequency.nCurValue <= 0 || static_cast<std::uint64_t>(frequency.nCurValue) != device_clock_hz_) {
+                throw std::runtime_error(serial_ + ": tick frequency differs from --device-clock-hz");
+            }
+            bool ptp_enabled = false;
+            check(MV_CC_GetBoolValue(session_.handle, "GevIEEE1588", &ptp_enabled), serial_ + ": read PTP configuration");
+            if (!ptp_enabled) throw std::runtime_error(serial_ + ": enable PTP before using device timestamps");
+        }
 
         if (trigger.empty()) {
             check(MV_CC_SetEnumValueByString(session_.handle, "TriggerMode", "Off"), serial_ + ": free run");
@@ -76,18 +94,22 @@ public:
     }
 
     std::optional<Frame> read() override {
+        if (device_clock_hz_ && Clock::now() >= next_ptp_check_) check_ptp_status();
         if (!session_.grabbing) {
-            check(MV_CC_StartGrabbing(session_.handle), serial_ + ": start grabbing");
+            check(MV_CC_StartGrabbing(session_.handle), serial_ + ": start grabbing", true);
             session_.grabbing = true;
         }
         Buffer buffer{session_.handle};
         const auto status = MV_CC_GetImageBuffer(session_.handle, &buffer.frame, 200);
         const auto received = Clock::now();
         if (static_cast<std::uint32_t>(status) == static_cast<std::uint32_t>(MV_E_NODATA)) return std::nullopt;
-        check(status, serial_ + ": get image");
+        check(status, serial_ + ": get image", true);
         buffer.acquired = true;
 
         const auto& info = buffer.frame.stFrameInfo;
+        const auto ticks = (static_cast<std::uint64_t>(info.nDevTimeStampHigh) << 32) | info.nDevTimeStampLow;
+        const auto sequence = info.nFrameNum;
+        if (info.nLostPacket) return Frame{{}, received, ticks, sequence, info.nLostPacket};
         const auto pixels = static_cast<std::uint64_t>(info.nWidth) * info.nHeight;
         if (info.nWidth == 0 || info.nHeight == 0 || info.nWidth > 8192 || info.nHeight > 8192 ||
             pixels > 16777216 || !buffer.frame.pBufAddr || info.nFrameLen == 0) {
@@ -119,12 +141,25 @@ public:
         }
         const auto release = MV_CC_FreeImageBuffer(session_.handle, &buffer.frame);
         buffer.acquired = false;
-        check(release, serial_ + ": release image");
-        return Frame{std::move(image), received};
+        check(release, serial_ + ": release image", true);
+        return Frame{std::move(image), received, ticks, sequence, 0};
     }
 
 private:
+    void check_ptp_status() {
+        MVCC_ENUMVALUE status{};
+        check(MV_CC_GetEnumValue(session_.handle, "GevIEEE1588Status", &status), serial_ + ": read PTP state", true);
+        MVCC_ENUMENTRY entry{};
+        entry.nValue = status.nCurValue;
+        check(MV_CC_GetEnumEntrySymbolic(session_.handle, "GevIEEE1588Status", &entry), serial_ + ": decode PTP state", true);
+        const std::string state(entry.chSymbolic, std::find(std::begin(entry.chSymbolic), std::end(entry.chSymbolic), '\0'));
+        if (state != "Master" && state != "Slave") throw CameraUnavailable(serial_ + ": PTP state=" + state);
+        next_ptp_check_ = Clock::now() + std::chrono::seconds(1);
+    }
+
     std::string serial_;
+    std::uint64_t device_clock_hz_;
+    Clock::time_point next_ptp_check_{};
     Session session_;
 };
 
@@ -145,13 +180,16 @@ void list_mvs_cameras() {
     }
 }
 
-std::unique_ptr<Camera> open_mvs_camera(const std::string& serial_number, const std::string& trigger) {
+std::unique_ptr<Camera> open_mvs_camera(const std::string& serial_number, const std::string& trigger,
+                                       std::uint64_t device_clock_hz, const std::string& profile) {
+    static std::mutex enumeration;
+    std::lock_guard<std::mutex> lock(enumeration);
     const auto devices = enumerate();
     for (unsigned int i = 0; i < devices.nDeviceNum; ++i) {
         auto* device = devices.pDeviceInfo[i];
         if (device && serial(*device) == serial_number) {
-            return std::make_unique<MvsCamera>(device, serial_number, trigger);
+            return std::make_unique<MvsCamera>(device, serial_number, trigger, device_clock_hz, profile);
         }
     }
-    throw std::runtime_error("camera serial not found: " + serial_number);
+    throw CameraUnavailable("camera serial not found: " + serial_number);
 }

@@ -65,24 +65,63 @@ Calibration load_calibration(const std::filesystem::path& path) {
                                              u >= 0 && u < 8192 && v >= 0 && v < 8192)) {
             throw std::runtime_error("calibration requires four rows of left_x left_y right_x right_y");
         }
+        const std::array<double, 4> coordinates{x, y, u, v};
+        for (std::size_t j = 0; j < coordinates.size(); ++j) {
+            auto& minimum = calibration.minimum_input_sizes[j];
+            minimum = std::max(minimum, static_cast<int>(std::ceil(coordinates[j])) + 1);
+        }
         x += calibration.left_x;
         y += calibration.left_y;
         system[2 * i] = {x, y, 1, 0, 0, 0, -x * u, -y * u, u};
         system[2 * i + 1] = {0, 0, 0, x, y, 1, -x * v, -y * v, v};
     }
     std::string extra;
-    if (input >> extra) throw std::runtime_error("unexpected data after calibration points");
+    if (input >> extra) {
+        Calibration::Binding binding;
+        if (extra != "cameras" || !(input >> binding.left_serial >> binding.sizes[0] >> binding.sizes[1]
+                                           >> binding.right_serial >> binding.sizes[2] >> binding.sizes[3]) ||
+            binding.left_serial == binding.right_serial || (input >> extra)) {
+            throw std::runtime_error("expected cameras LEFT_SERIAL WIDTH HEIGHT RIGHT_SERIAL WIDTH HEIGHT");
+        }
+        for (std::size_t i = 0; i < binding.sizes.size(); ++i) {
+            if (binding.sizes[i] < calibration.minimum_input_sizes[i] || binding.sizes[i] > 8192) {
+                throw std::runtime_error("calibration points fall outside the bound camera dimensions");
+            }
+        }
+        calibration.binding = std::move(binding);
+    }
     calibration.right_from_canvas = solve(system);
+    const auto& h = calibration.right_from_canvas;
+    for (int x : {0, calibration.width - 1}) {
+        for (int y : {0, calibration.height - 1}) {
+            if (!(h[6] * x + h[7] * y + 1 > 1e-9)) {
+                throw std::runtime_error("calibration horizon intersects the output canvas");
+            }
+        }
+    }
     return calibration;
 }
 
-Stitcher::Stitcher(Calibration calibration) : calibration_(calibration) {
-    result_.width = calibration.width;
-    result_.height = calibration.height;
+Stitcher::Stitcher(Calibration calibration, int threads)
+    : calibration_(std::move(calibration)), threads_(threads) {
+#ifndef _OPENMP
+    if (threads_ != 1) throw std::runtime_error("parallel stitching requires a build with OpenMP");
+#endif
+    result_.width = calibration_.width;
+    result_.height = calibration_.height;
     result_.bgr.resize(static_cast<std::size_t>(result_.width) * result_.height * 3);
 }
 
 void Stitcher::prepare(const Image& left, const Image& right) {
+    const std::array<int, 4> sizes{left.width, left.height, right.width, right.height};
+    if (calibration_.binding && calibration_.binding->sizes != sizes) {
+        throw std::runtime_error("camera dimensions differ from the calibration; check ROI");
+    }
+    for (std::size_t i = 0; i < sizes.size(); ++i) {
+        if (sizes[i] < calibration_.minimum_input_sizes[i]) {
+            throw std::runtime_error("calibration points fall outside the captured image");
+        }
+    }
     const auto& h = calibration_.right_from_canvas;
     map_.assign(result_.bgr.size() / 3, {});
     std::size_t overlap = 0;
@@ -106,15 +145,24 @@ void Stitcher::prepare(const Image& left, const Image& right) {
         }
     }
     if (overlap == 0) throw std::runtime_error("the calibrated images do not overlap on the canvas");
-    source_sizes_ = {left.width, left.height, right.width, right.height};
+    source_sizes_ = sizes;
 }
 
 const Image& Stitcher::stitch(const Image& left, const Image& right) {
+    for (const Image* image : {&left, &right}) {
+        if (image->width <= 0 || image->height <= 0 || image->width > 8192 || image->height > 8192 ||
+            image->bgr.size() != static_cast<std::size_t>(image->width) * image->height * 3) {
+            throw std::runtime_error("invalid BGR frame dimensions or payload");
+        }
+    }
     if (map_.empty()) {
         prepare(left, right);
     } else if (source_sizes_ != std::array<int, 4>{left.width, left.height, right.width, right.height}) {
         throw std::runtime_error("camera frame size changed; check ROI and recalibrate");
     }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(threads_) if(threads_ > 1)
+#endif
     for (int y = 0; y < result_.height; ++y) {
         for (int x = 0; x < result_.width; ++x) {
             const auto target = offset(x, y, result_);
