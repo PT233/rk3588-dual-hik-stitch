@@ -1,5 +1,6 @@
 #include "pipeline.hpp"
 #include "raw_output.hpp"
+#include "stitch.hpp"
 
 #include <iostream>
 #include <thread>
@@ -88,6 +89,59 @@ void no_pair_deadline() {
     require(timed_out, "no-pair watchdog failed");
 }
 
+Image flat_image(std::array<std::uint8_t, 3> bgr) {
+    Image result{48, 32, std::vector<std::uint8_t>(48 * 32 * 3)};
+    for (std::size_t i = 0; i < result.bgr.size(); ++i) result.bgr[i] = bgr[i % 3];
+    return result;
+}
+
+std::array<std::uint8_t, 3> pixel_at(const Image& image, int x, int y) {
+    const auto offset = (y * image.width + x) * 3;
+    return {image.bgr[offset], image.bgr[offset + 1], image.bgr[offset + 2]};
+}
+
+void photometric_matching() {
+    using Pixel = std::array<std::uint8_t, 3>;
+    Calibration calibration{};
+    calibration.width = 72;
+    calibration.height = 32;
+    calibration.right_from_canvas = {1, 0, -24, 0, 1, 0, 0, 0};
+
+    const auto left = flat_image({72, 112, 144});
+    const auto dim = flat_image({48, 75, 96});
+    Stitcher reference(calibration);
+    require(pixel_at(reference.stitch(left, dim), 60, 10) == Pixel{48, 75, 96}, "default colors changed");
+
+    Stitcher exposure(calibration, StitchOptions{1, true, false, false});
+    const auto& bright = exposure.stitch(left, dim);
+    require(pixel_at(bright, 60, 10) == Pixel{72, 112, 144}, "exposure gain did not match the reference");
+    require(pixel_at(bright, 8, 10) == Pixel{72, 112, 144}, "correction changed the left reference");
+
+    auto tinted = flat_image({54, 84, 96});
+    for (int y = 0; y < 7; ++y) {
+        for (int x = 0; x < 24; ++x) {
+            const auto index = (y * tinted.width + x) * 3;
+            tinted.bgr[index] = 220;
+            tinted.bgr[index + 1] = 42;
+            tinted.bgr[index + 2] = 100;
+        }
+    }
+    Stitcher color(calibration, StitchOptions{1, true, true, false});
+    require(pixel_at(color.stitch(left, tinted), 60, 10) == Pixel{72, 112, 144},
+            "robust color match failed with an overlap outlier");
+
+    const auto clipped = flat_image({250, 250, 250});
+    const auto& invalid = color.stitch(clipped, tinted);
+    require(pixel_at(invalid, 60, 10) == Pixel{72, 112, 144}, "invalid samples changed the prior correction");
+    for (int i = 0; i < 5; ++i) color.stitch(clipped, tinted);
+    require(pixel_at(color.stitch(clipped, tinted), 60, 10) == Pixel{72, 112, 144}, "clipped update was accepted");
+
+    Stitcher gray(calibration, StitchOptions{1, true, true, true});
+    const auto& grayscale = gray.stitch(left, tinted);
+    require(pixel_at(grayscale, 8, 10) == Pixel{117, 117, 117} &&
+            pixel_at(grayscale, 60, 10) == Pixel{117, 117, 117}, "grayscale output does not preserve luminance");
+}
+
 #ifndef _WIN32
 void output_deadline() {
     int pipe_fds[2];
@@ -114,6 +168,7 @@ int main() {
     try {
         reconnect_and_resynchronize();
         no_pair_deadline();
+        photometric_matching();
 #ifndef _WIN32
         output_deadline();
 #endif

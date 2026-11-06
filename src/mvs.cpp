@@ -60,7 +60,7 @@ struct Buffer {
 class MvsCamera final : public Camera {
 public:
     MvsCamera(MV_CC_DEVICE_INFO* device, std::string serial_number, const std::string& trigger,
-              std::uint64_t device_clock_hz, const std::string& profile)
+              std::uint64_t device_clock_hz, const std::string& profile, AutoExposure auto_exposure)
         : serial_(std::move(serial_number)), device_clock_hz_(device_clock_hz) {
         check(MV_CC_CreateHandle(&session_.handle, device), serial_ + ": create handle", true);
         check(MV_CC_OpenDevice(session_.handle, MV_ACCESS_Exclusive, 0), serial_ + ": open camera", true);
@@ -87,6 +87,16 @@ public:
             check(MV_CC_SetEnumValueByString(session_.handle, "TriggerSelector", "FrameStart"), serial_ + ": FrameStart");
             check(MV_CC_SetEnumValueByString(session_.handle, "TriggerMode", "On"), serial_ + ": enable trigger");
             check(MV_CC_SetEnumValueByString(session_.handle, "TriggerSource", trigger.c_str()), serial_ + ": trigger source");
+        }
+        const char* mode = nullptr;
+        switch (auto_exposure) {
+            case AutoExposure::profile: break;
+            case AutoExposure::off: mode = "Off"; break;
+            case AutoExposure::once: mode = "Once"; break;
+            case AutoExposure::continuous: mode = "Continuous"; break;
+        }
+        if (mode) {
+            check(MV_CC_SetEnumValueByString(session_.handle, "ExposureAuto", mode), serial_ + ": set ExposureAuto");
         }
         if (device->nTLayerType == MV_USB_DEVICE) {
             check(MV_CC_SetGrabStrategy(session_.handle, MV_GrabStrategy_LatestImagesOnly), serial_ + ": set grab strategy");
@@ -181,14 +191,15 @@ void list_mvs_cameras() {
 }
 
 std::unique_ptr<Camera> open_mvs_camera(const std::string& serial_number, const std::string& trigger,
-                                       std::uint64_t device_clock_hz, const std::string& profile) {
+                                       std::uint64_t device_clock_hz, const std::string& profile,
+                                       AutoExposure auto_exposure) {
     static std::mutex enumeration;
     std::lock_guard<std::mutex> lock(enumeration);
     const auto devices = enumerate();
     for (unsigned int i = 0; i < devices.nDeviceNum; ++i) {
         auto* device = devices.pDeviceInfo[i];
         if (device && serial(*device) == serial_number) {
-            return std::make_unique<MvsCamera>(device, serial_number, trigger, device_clock_hz, profile);
+            return std::make_unique<MvsCamera>(device, serial_number, trigger, device_clock_hz, profile, auto_exposure);
         }
     }
     throw CameraUnavailable("camera serial not found: " + serial_number);

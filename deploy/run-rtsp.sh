@@ -35,6 +35,14 @@ esac
 if [[ -n ${TRIGGER_SOURCE:-} ]]; then capture+=(--trigger "$TRIGGER_SOURCE"); fi
 if [[ -n ${LEFT_PROFILE:-} ]]; then capture+=(--left-profile "$LEFT_PROFILE"); fi
 if [[ -n ${RIGHT_PROFILE:-} ]]; then capture+=(--right-profile "$RIGHT_PROFILE"); fi
+if [[ -n ${CAMERA_AUTO_EXPOSURE:-} ]]; then capture+=(--camera-auto-exposure "$CAMERA_AUTO_EXPOSURE"); fi
+for setting in AUTO_EXPOSURE AUTO_COLOR GRAYSCALE; do
+    case "${!setting:-0}" in
+        0) ;;
+        1) flag=${setting,,}; capture+=("--${flag//_/-}") ;;
+        *) echo "$setting must be 0 or 1" >&2; exit 1 ;;
+    esac
+done
 
 case "$encoder" in
     h264_rkmpp) pixel_format=nv12 ;;

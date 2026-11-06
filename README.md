@@ -59,6 +59,19 @@ set -o pipefail
 
 RK3588 的 FFmpeg 若包含 `h264_rkmpp`，可把编码参数换成 `-vf format=nv12 -c:v h264_rkmpp -b:v 4M`。先用 `ffmpeg -encoders` 核对编码器。几何拼接在 CPU 上运行，构建找到 OpenMP 时可用 `--stitch-threads 2` 或 `4`，实测后选择线程数。[Rockchip FFmpeg 编码器文档](https://github.com/nyanmisaka/ffmpeg-rockchip/wiki/Encoder)
 
+## 曝光、校色与灰度
+
+| 选项 | 行为 |
+| --- | --- |
+| `--camera-auto-exposure off\|once\|continuous` | 通过 MVS 设置两台相机的 `ExposureAuto`，控制传感器曝光时间。省略时沿用相机或配置文件设置。启用前在 MVS 中确认型号、触发模式及自动曝光上下限。 |
+| `--auto-exposure` | 用几何对齐后的重叠区估计亮度比，把右图亮度匹配到左图。 |
+| `--auto-color` | 用重叠区估计右图相对左图的 BGR 通道增益，用于匹配两台彩色相机的色差。需要可用的重叠视野，若要测量物体的绝对颜色，需另外做色卡标定。 |
+| `--grayscale` | 将拼接结果转为灰度。仍输出三通道 BGR24，三个通道写入相同亮度值，兼容既有 FFmpeg 管道。 |
+
+软件校正每五帧最多取 1024 组对应像素，过滤暗点和接近饱和的采样，用中位数估计增益并限制幅度、平滑更新。有效样本不足时沿用上次结果。建议固定工位先通过 MVS 设置两路相机的曝光和白平衡，再开启软件亮度及色差匹配。光照变化较大时，可在相机允许的模式下试用连续自动曝光，复测运动模糊和两路同步。已过曝的细节需要通过采集设置解决。[海康相机曝光模式说明](https://www.hikrobotics.com/en2/Hikrobotics/Machine%20Vision/01%20Product/%E5%B7%A5%E4%B8%9A%E9%9D%A2%E9%98%B5%E7%9B%B8%E6%9C%BA/CS/%E7%94%A8%E6%88%B7%E6%89%8B%E5%86%8C/UD26223B_GigE%20Area%20Scan%20Camera%20User%20Manual_V3.4.50_20211117.pdf)
+
+RTSP 服务通过 `CAMERA_AUTO_EXPOSURE`、`AUTO_EXPOSURE`、`AUTO_COLOR` 和 `GRAYSCALE` 启用上述选项。
+
 ## Linux 服务部署
 
 将含 MVS 的构建用 `sudo cmake --install build-mvs --prefix /usr/local` 安装。创建 `dualhik` 服务账户，按板厂和海康 SDK 的要求为该账户配置相机与编码设备访问权限。将 `deploy/dual-hik-stitch.service` 安装到 `/etc/systemd/system/`，将 `deploy/service.env.example` 复制为 `/etc/dual-hik-stitch/service.env` 并填写双摄序列号、现场标定和 RTSP 发布地址。RTSP 接收服务须事先启动，例如同板上的 MediaMTX。需要定制安装路径时同步修改服务文件和 `CAPTURE_BIN`。完成后可用 `sudo systemctl daemon-reload`、`sudo systemctl enable --now dual-hik-stitch` 和 `journalctl -u dual-hik-stitch -f` 部署和查看状态。

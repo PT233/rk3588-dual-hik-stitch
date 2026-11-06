@@ -27,7 +27,8 @@ struct Options {
     std::filesystem::path calibration, snapshot, output;
     int fps = 30;
     int frames = 0;
-    int stitch_threads = 1;
+    StitchOptions stitch;
+    AutoExposure camera_auto_exposure = AutoExposure::profile;
     std::chrono::milliseconds write_timeout{2000};
     CapturePolicy capture;
 };
@@ -40,6 +41,8 @@ void usage(std::ostream& out) {
            "  [--trigger Line0] [--device-clock-hz N (PTP GigE)] [--require-bound-calibration]\n"
            "  [--left-profile FILE] [--right-profile FILE] (MVS feature files)\n"
            "  [--camera-timeout-ms N] [--pair-timeout-ms N] [--write-timeout-ms N (Linux)]\n"
+           "  [--camera-auto-exposure off|once|continuous] (MVS sensor)\n"
+           "  [--auto-exposure] [--auto-color] [--grayscale] (stitched video)\n"
            "  [--stitch-threads N] [--output FILE (default: raw BGR24 on stdout)]\n";
 }
 
@@ -66,6 +69,16 @@ Options parse(int argc, char** argv) {
         if (flag == "--synthetic") options.synthetic = true;
         else if (flag == "--list") options.list = true;
         else if (flag == "--require-bound-calibration") options.require_bound_calibration = true;
+        else if (flag == "--auto-exposure") options.stitch.auto_exposure = true;
+        else if (flag == "--auto-color") options.stitch.auto_color = true;
+        else if (flag == "--grayscale") options.stitch.grayscale = true;
+        else if (flag == "--camera-auto-exposure") {
+            const auto mode = value();
+            if (mode == "off") options.camera_auto_exposure = AutoExposure::off;
+            else if (mode == "once") options.camera_auto_exposure = AutoExposure::once;
+            else if (mode == "continuous") options.camera_auto_exposure = AutoExposure::continuous;
+            else throw std::runtime_error("--camera-auto-exposure requires off, once or continuous");
+        }
         else if (flag == "--left") options.left = value();
         else if (flag == "--right") options.right = value();
         else if (flag == "--left-profile") options.left_profile = value();
@@ -82,14 +95,15 @@ Options parse(int argc, char** argv) {
         else if (flag == "--pair-timeout-ms") options.capture.no_pair_timeout = std::chrono::milliseconds(number(value(), 200, 300000));
         else if (flag == "--write-timeout-ms") options.write_timeout = std::chrono::milliseconds(number(value(), 10, 30000));
         else if (flag == "--device-clock-hz") options.capture.device_clock_hz = number(value(), 1, 2000000000);
-        else if (flag == "--stitch-threads") options.stitch_threads = number(value(), 1, 8);
+        else if (flag == "--stitch-threads") options.stitch.threads = number(value(), 1, 8);
         else throw std::runtime_error("unknown option: " + std::string(flag));
     }
     if (options.list && argc != 2) throw std::runtime_error("--list must be used alone");
     if (options.list) return options;
     if (options.synthetic) {
         if (!options.left.empty() || !options.right.empty() || !options.trigger.empty() || options.capture.device_clock_hz ||
-            !options.left_profile.empty() || !options.right_profile.empty()) {
+            !options.left_profile.empty() || !options.right_profile.empty() ||
+            options.camera_auto_exposure != AutoExposure::profile) {
             throw std::runtime_error("--synthetic cannot take MVS camera settings");
         }
     } else if (options.left.empty() || options.right.empty() || options.left == options.right) {
@@ -100,6 +114,9 @@ Options parse(int argc, char** argv) {
     }
     if (!options.snapshot.empty() && (!options.output.empty() || options.frames != 0 || options.require_bound_calibration)) {
         throw std::runtime_error("--snapshot cannot take --output, --frames or --require-bound-calibration");
+    }
+    if (!options.snapshot.empty() && (options.stitch.auto_exposure || options.stitch.auto_color || options.stitch.grayscale)) {
+        throw std::runtime_error("photometric output options require --calibration");
     }
     return options;
 }
@@ -139,8 +156,8 @@ private:
 
 class StitchStream final : public lystream::StreamControl {
 public:
-    StitchStream(PairStream& source, Calibration calibration, RawOutput& output, int threads)
-        : StreamControl(&source), stitcher_(std::move(calibration), threads), output_(output) {}
+    StitchStream(PairStream& source, Calibration calibration, RawOutput& output, StitchOptions options)
+        : StreamControl(&source), stitcher_(std::move(calibration), options), output_(output) {}
 
 private:
     void DataTransferCall(void* data) override {
@@ -183,10 +200,12 @@ void run(const Options& options) {
 #ifdef ENABLE_MVS
     else {
         cameras[0] = [&] {
-            return open_mvs_camera(options.left, options.trigger, options.capture.device_clock_hz, options.left_profile);
+            return open_mvs_camera(options.left, options.trigger, options.capture.device_clock_hz,
+                                   options.left_profile, options.camera_auto_exposure);
         };
         cameras[1] = [&] {
-            return open_mvs_camera(options.right, options.trigger, options.capture.device_clock_hz, options.right_profile);
+            return open_mvs_camera(options.right, options.trigger, options.capture.device_clock_hz,
+                                   options.right_profile, options.camera_auto_exposure);
         };
     }
 #endif
@@ -219,7 +238,7 @@ void run(const Options& options) {
     }
     RawOutput output(options.output, options.write_timeout);
     std::cerr << "output=bgr24 size=" << calibration.width << 'x' << calibration.height << '\n';
-    StitchStream stitch(source, std::move(calibration), output, options.stitch_threads);
+    StitchStream stitch(source, std::move(calibration), output, options.stitch);
     stitch.StartStream();
     source.run(options.frames, stopped);
     stitch.StopStream();

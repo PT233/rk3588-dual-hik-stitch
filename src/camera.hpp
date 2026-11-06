@@ -35,6 +35,8 @@ public:
     virtual std::optional<Frame> read() = 0;
 };
 
+enum class AutoExposure { profile, off, once, continuous };
+
 #ifdef ENABLE_MVS
 class MvsRuntime {
 public:
@@ -46,5 +48,6 @@ public:
 
 void list_mvs_cameras();
 std::unique_ptr<Camera> open_mvs_camera(const std::string& serial, const std::string& trigger,
-                                       std::uint64_t device_clock_hz, const std::string& profile);
+                                       std::uint64_t device_clock_hz, const std::string& profile,
+                                       AutoExposure auto_exposure);
 #endif

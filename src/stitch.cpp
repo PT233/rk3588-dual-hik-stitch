@@ -45,6 +45,44 @@ std::size_t offset(int x, int y, const Image& image) {
     return (static_cast<std::size_t>(y) * image.width + x) * 3;
 }
 
+std::array<float, 3> interpolate(float x, float y, const Image& image) {
+    const int ix = static_cast<int>(x);
+    const int iy = static_cast<int>(y);
+    const float dx = x - ix;
+    const float dy = y - iy;
+    const int next_x = std::min(ix + 1, image.width - 1);
+    const int next_y = std::min(iy + 1, image.height - 1);
+    const auto a = offset(ix, iy, image), b = offset(next_x, iy, image);
+    const auto c = offset(ix, next_y, image), d = offset(next_x, next_y, image);
+    std::array<float, 3> value{};
+    for (int ch = 0; ch < 3; ++ch) {
+        const float upper = (1 - dx) * image.bgr[a + ch] + dx * image.bgr[b + ch];
+        const float lower = (1 - dx) * image.bgr[c + ch] + dx * image.bgr[d + ch];
+        value[ch] = (1 - dy) * upper + dy * lower;
+    }
+    return value;
+}
+
+template <class Pixel>
+float luminance(const Pixel& p) {
+    return (29.f * p[0] + 150.f * p[1] + 77.f * p[2]) / 256.f;
+}
+
+void grayscale(std::uint8_t* pixel) {
+    const auto y = static_cast<std::uint8_t>(luminance(pixel) + 0.5f);
+    std::fill_n(pixel, 3, y);
+}
+
+float median(std::vector<float>& values) {
+    auto middle = values.begin() + values.size() / 2;
+    std::nth_element(values.begin(), middle, values.end());
+    return *middle;
+}
+
+float adapt_gain(float previous, float target, bool initialized) {
+    return initialized ? previous + 0.15f * (target - previous) : target;
+}
+
 }  // namespace
 
 Calibration load_calibration(const std::filesystem::path& path) {
@@ -102,10 +140,10 @@ Calibration load_calibration(const std::filesystem::path& path) {
     return calibration;
 }
 
-Stitcher::Stitcher(Calibration calibration, int threads)
-    : calibration_(std::move(calibration)), threads_(threads) {
+Stitcher::Stitcher(Calibration calibration, StitchOptions options)
+    : calibration_(std::move(calibration)), options_(options) {
 #ifndef _OPENMP
-    if (threads_ != 1) throw std::runtime_error("parallel stitching requires a build with OpenMP");
+    if (options_.threads != 1) throw std::runtime_error("parallel stitching requires a build with OpenMP");
 #endif
     result_.width = calibration_.width;
     result_.height = calibration_.height;
@@ -145,7 +183,53 @@ void Stitcher::prepare(const Image& left, const Image& right) {
         }
     }
     if (overlap == 0) throw std::runtime_error("the calibrated images do not overlap on the canvas");
+    if (options_.auto_exposure || options_.auto_color) {
+        const auto stride = (overlap + 1023) / 1024;
+        std::size_t seen = 0;
+        for (std::size_t i = 0; i < map_.size(); ++i) {
+            const auto weight = map_[i].right_weight;
+            if (weight > 0 && weight < 1 && seen++ % stride == 0) samples_.push_back(i);
+        }
+    }
     source_sizes_ = sizes;
+}
+
+void Stitcher::update_correction(const Image& left, const Image& right) {
+    std::vector<float> exposure;
+    std::array<std::vector<float>, 3> colors;
+    if (options_.auto_exposure) exposure.reserve(samples_.size());
+    if (options_.auto_color) {
+        for (auto& channel : colors) channel.reserve(samples_.size());
+    }
+    for (const auto index : samples_) {
+        const int x = static_cast<int>(index % result_.width) - calibration_.left_x;
+        const int y = static_cast<int>(index / result_.width) - calibration_.left_y;
+        const auto* reference = left.bgr.data() + offset(x, y, left);
+        const auto& mapping = map_[index];
+        const auto sample = interpolate(mapping.right_x, mapping.right_y, right);
+        const auto left_y = luminance(reference), right_y = luminance(sample);
+        if (left_y < 16 || right_y < 16 || *std::max_element(reference, reference + 3) >= 245 ||
+            *std::max_element(sample.begin(), sample.end()) >= 245) continue;
+        const auto brightness_ratio = left_y / right_y;
+        if (options_.auto_exposure) exposure.push_back(brightness_ratio);
+        if (options_.auto_color && *std::min_element(reference, reference + 3) >= 12 &&
+            *std::min_element(sample.begin(), sample.end()) >= 12) {
+            for (int ch = 0; ch < 3; ++ch) {
+                colors[ch].push_back(reference[ch] / (sample[ch] * brightness_ratio));
+            }
+        }
+    }
+    if (exposure.size() >= 32) {
+        exposure_gain_ = adapt_gain(exposure_gain_, std::clamp(median(exposure), 0.5f, 2.f), exposure_initialized_);
+        exposure_initialized_ = true;
+    }
+    if (colors[0].size() >= 32) {
+        for (int ch = 0; ch < 3; ++ch) {
+            const auto target = std::clamp(median(colors[ch]), 0.67f, 1.5f);
+            color_gains_[ch] = adapt_gain(color_gains_[ch], target, color_initialized_);
+        }
+        color_initialized_ = true;
+    }
 }
 
 const Image& Stitcher::stitch(const Image& left, const Image& right) {
@@ -160,8 +244,18 @@ const Image& Stitcher::stitch(const Image& left, const Image& right) {
     } else if (source_sizes_ != std::array<int, 4>{left.width, left.height, right.width, right.height}) {
         throw std::runtime_error("camera frame size changed; check ROI and recalibrate");
     }
+    const bool correct = options_.auto_exposure || options_.auto_color;
+    if (correct) {
+        if (frames_until_update_ == 0) {
+            update_correction(left, right);
+            frames_until_update_ = 5;
+        }
+        --frames_until_update_;
+    }
+    auto gains = color_gains_;
+    for (auto& gain : gains) gain = std::clamp(gain * exposure_gain_, 0.5f, 2.f);
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static) num_threads(threads_) if(threads_ > 1)
+#pragma omp parallel for schedule(static) num_threads(options_.threads) if(options_.threads > 1)
 #endif
     for (int y = 0; y < result_.height; ++y) {
         for (int x = 0; x < result_.width; ++x) {
@@ -175,28 +269,19 @@ const Image& Stitcher::stitch(const Image& left, const Image& right) {
                 } else {
                     std::fill_n(result_.bgr.data() + target, 3, 0);
                 }
+                if (options_.grayscale) grayscale(result_.bgr.data() + target);
                 continue;
             }
 
-            const int rx = static_cast<int>(pixel.right_x);
-            const int ry = static_cast<int>(pixel.right_y);
-            const float dx = pixel.right_x - rx;
-            const float dy = pixel.right_y - ry;
-            const int next_x = std::min(rx + 1, right.width - 1);
-            const int next_y = std::min(ry + 1, right.height - 1);
-            const auto a = offset(rx, ry, right);
-            const auto b = offset(next_x, ry, right);
-            const auto c = offset(rx, next_y, right);
-            const auto d = offset(next_x, next_y, right);
+            const auto sample = interpolate(pixel.right_x, pixel.right_y, right);
             for (int ch = 0; ch < 3; ++ch) {
-                const float upper = (1 - dx) * right.bgr[a + ch] + dx * right.bgr[b + ch];
-                const float lower = (1 - dx) * right.bgr[c + ch] + dx * right.bgr[d + ch];
-                float value = (1 - dy) * upper + dy * lower;
+                float value = correct ? std::min(sample[ch] * gains[ch], 255.f) : sample[ch];
                 if (pixel.right_weight < 1) {
                     value = pixel.right_weight * value + (1 - pixel.right_weight) * left.bgr[offset(lx, ly, left) + ch];
                 }
                 result_.bgr[target + ch] = static_cast<std::uint8_t>(value + 0.5f);
             }
+            if (options_.grayscale) grayscale(result_.bgr.data() + target);
         }
     }
     return result_;

@@ -22,9 +22,16 @@ struct Calibration {
 
 Calibration load_calibration(const std::filesystem::path& path);
 
+struct StitchOptions {
+    int threads = 1;
+    bool auto_exposure = false;
+    bool auto_color = false;
+    bool grayscale = false;
+};
+
 class Stitcher {
 public:
-    explicit Stitcher(Calibration calibration, int threads = 1);
+    explicit Stitcher(Calibration calibration, StitchOptions options = {});
     const Image& stitch(const Image& left, const Image& right);
 
 private:
@@ -35,10 +42,16 @@ private:
     };
 
     void prepare(const Image& left, const Image& right);
+    void update_correction(const Image& left, const Image& right);
 
     Calibration calibration_;
-    int threads_;
+    StitchOptions options_;
     std::array<int, 4> source_sizes_{};
     std::vector<Pixel> map_;
+    std::vector<std::size_t> samples_;
+    float exposure_gain_ = 1;
+    std::array<float, 3> color_gains_{1, 1, 1};
+    bool exposure_initialized_ = false, color_initialized_ = false;
+    unsigned int frames_until_update_ = 0;
     Image result_;
 };
